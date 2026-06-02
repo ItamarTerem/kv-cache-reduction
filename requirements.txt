@@ -1,0 +1,33 @@
+# requirements.txt — DeepSeek-V2-Lite KV nopeless cache project
+#
+# DO NOT add torch here.
+# It is installed separately by scripts/setup_runtime.sh because it requires
+# a specific --index-url that pip -r cannot pass:
+#   torch → https://download.pytorch.org/whl/cu128  (CUDA version specific)
+
+# ── Model loading ────────────────────────────────────────────────────────────
+# transformers: DeepSeek-V2-Lite requires trust_remote_code=True and a recent
+# transformers. Upper bound avoids 5.x breaking the custom modeling code.
+transformers>=4.57.1,<5.0.0
+
+# accelerate: required for device_map="auto" in AutoModelForCausalLM
+accelerate>=0.33.0
+
+# safetensors: DeepSeek-V2-Lite weights are stored in safetensors format
+safetensors>=0.4.0
+
+# huggingface_hub: model download and cache management
+huggingface_hub>=0.24.0
+
+# hf_transfer: C-based download accelerator; needed for
+# HF_HUB_ENABLE_HF_TRANSFER=1 (set in the venv activate by setup_runtime.sh)
+# to have any effect. Without this package the env var is silently ignored.
+hf_transfer>=0.1.4
+
+# ── Verification (verify_kv_relation.py) ─────────────────────────────────────
+numpy>=1.26.0
+tqdm>=4.66.0
+
+# nvidia-ml-py: Python bindings for NVML; reads live GPU memory and utilisation
+# during throughput tests in verify_kv_relation.py
+nvidia-ml-py>=12.560.30
