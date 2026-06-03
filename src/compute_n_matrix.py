@@ -78,18 +78,22 @@ def _split_kv_weight(
     """
     Split the kv_b weight matrix into K and V blocks.
 
-    DeepSeek-V2-Lite uses a flat blocked layout:
-        rows 0 .. total_k_dim-1          → all K heads
-        rows total_k_dim .. end          → all V heads
+    DeepSeek-V2-Lite uses an interleaved layout — matching its forward pass:
+
+        kv = kv_b_proj(compressed_kv)
+        kv = kv.view(B, S, num_heads, qk_nope_head_dim + v_head_dim)
+        k_nope, v = torch.split(kv, [qk_nope_head_dim, v_head_dim], dim=-1)
+
+    Weight rows are therefore ordered:
+        [ K_h0 | V_h0 | K_h1 | V_h1 | ... | K_hN | V_hN ]
 
     Returns:
         W_K: [num_kv_heads, qk_nope_head_dim, lora_rank]
         W_V: [num_kv_heads, v_head_dim,       lora_rank]
     """
-    lora_rank   = W.shape[1]
-    total_k_dim = num_kv_heads * qk_nope_head_dim
-    total_v_dim = num_kv_heads * v_head_dim
-    expected_rows = total_k_dim + total_v_dim
+    lora_rank     = W.shape[1]
+    per_head_dim  = qk_nope_head_dim + v_head_dim
+    expected_rows = num_kv_heads * per_head_dim
 
     if W.shape[0] != expected_rows:
         raise ValueError(
@@ -98,9 +102,9 @@ def _split_kv_weight(
             f"({qk_nope_head_dim} + {v_head_dim}))."
         )
 
-    W_double = W.double()
-    W_K = W_double[:total_k_dim, :].view(num_kv_heads, qk_nope_head_dim, lora_rank)
-    W_V = W_double[total_k_dim:,  :].view(num_kv_heads, v_head_dim,       lora_rank)
+    W_double = W.double().view(num_kv_heads, per_head_dim, lora_rank)
+    W_K = W_double[:, :qk_nope_head_dim, :]   # [H, qk_nope, lora_rank]
+    W_V = W_double[:, qk_nope_head_dim:,  :]  # [H, v_dim,   lora_rank]
     return W_K, W_V
 
 
@@ -108,14 +112,24 @@ def _split_kv_weight(
 
 def compute_N_matrix(
     attn: nn.Module,
-    out_dtype: torch.dtype = torch.bfloat16,
+    out_dtype: torch.dtype = torch.float32,
+    svd_threshold: float = 1e-5,
     verbose: bool = False,
 ) -> torch.Tensor:
     """
     Compute the KV relation matrix N for a single MLA attention module.
 
+    Uses truncated SVD to compute the pseudo-inverse of W_V, discarding
+    singular values below svd_threshold * max(s). This avoids dividing by
+    near-zero singular values that would amplify noise in ill-conditioned heads.
+
+    Args:
+        svd_threshold: relative cutoff — singular values smaller than
+                       svd_threshold * s.max() are treated as zero.
+                       Default 1e-5 keeps all numerically meaningful components.
+
     Returns:
-        N: [num_kv_heads, v_head_dim, qk_nope_head_dim]
+        N: [num_kv_heads, v_head_dim, qk_nope_head_dim], dtype=out_dtype
     """
     W                = _get_kv_weight(attn)
     num_kv_heads     = _get_num_kv_heads(attn)
@@ -126,16 +140,37 @@ def compute_N_matrix(
 
     N_heads = []
     for h in range(num_kv_heads):
-        # pinv(W_V[h].T): [v_head_dim, lora_rank]
-        # W_K[h].T:       [lora_rank, qk_nope_head_dim]
-        # N_h:            [v_head_dim, qk_nope_head_dim]
-        pinv_WV_T = torch.linalg.pinv(W_V[h].T)
-        N_h       = pinv_WV_T @ W_K[h].T
+        # W_V[h]:   [v_head_dim,       lora_rank]  →  W_V[h].T: [lora_rank, v_head_dim]
+        # W_K[h]:   [qk_nope_head_dim, lora_rank]  →  W_K[h].T: [lora_rank, qk_nope_head_dim]
+        #
+        # SVD of W_V[h]  (fat matrix [v_dim, lora_rank], full_matrices=False):
+        #   U:  [v_dim, v_dim]
+        #   s:  [v_dim]
+        #   Vh: [v_dim, lora_rank]
+        #
+        # pinv(W_V[h]) = Vh.T @ diag(1/s) @ U.T   shape [lora_rank, v_dim]
+        # pinv(W_V[h].T) = U @ diag(1/s) @ Vh      shape [v_dim, lora_rank]
+        #
+        # N_h = pinv(W_V[h].T) @ W_K[h].T           shape [v_dim, qk_nope]
+
+        U, s, Vh = torch.linalg.svd(W_V[h], full_matrices=False)
+        # U:  [v_dim, v_dim],  s: [v_dim],  Vh: [v_dim, lora_rank]
+
+        s_inv = torch.where(
+            s > svd_threshold * s.max(),
+            1.0 / s,
+            torch.zeros_like(s),
+        )
+
+        # pinv(W_V[h].T) = U @ diag(s_inv) @ Vh
+        pinv_WV_T = U @ torch.diag(s_inv) @ Vh        # [v_dim, lora_rank]
+        N_h       = pinv_WV_T @ W_K[h].T              # [v_dim, qk_nope]
         N_heads.append(N_h)
 
         if verbose:
-            cond = torch.linalg.cond(W_V[h].float()).item()
-            print(f"    head {h:2d}: cond(W_V)={cond:.1f}")
+            n_kept = (s > svd_threshold * s.max()).sum().item()
+            print(f"    head {h:2d}: max_s={s.max():.3f}  min_s={s.min():.3f}"
+                  f"  kept={n_kept}/{len(s)}  cond={s.max()/s[s > 0].min():.1f}")
 
     N = torch.stack(N_heads, dim=0).to(dtype=out_dtype)
     return N
@@ -145,7 +180,7 @@ def compute_N_matrix(
 
 def compute_all_N_matrices(
     model: nn.Module,
-    out_dtype: torch.dtype = torch.bfloat16,
+    out_dtype: torch.dtype = torch.float32,
     device: torch.device | None = None,
     verbose: bool = False,
 ) -> list[torch.Tensor]:

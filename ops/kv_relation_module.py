@@ -92,7 +92,10 @@ class KVRelationModule(nn.Module):
             v  [B, H, S, v_dim]  @  N  [H, v_dim, k_dim]  →  [B, H, S, k_dim]
             N's H dimension broadcasts over B automatically.
         """
-        return torch.matmul(v, self.N)
+        # Upcast to FP32 for the matmul — N is FP32, and doing the dot product
+        # in FP32 avoids BF16 rounding accumulation over the v_head_dim elements.
+        # Cast result back to v's original dtype before returning.
+        return torch.matmul(v.float(), self.N).to(v.dtype)
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
 

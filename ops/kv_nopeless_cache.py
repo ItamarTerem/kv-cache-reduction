@@ -65,6 +65,16 @@ class KVNopelessCache(DynamicCache):
         k = torch.cat([k_nope, k_rope], dim=-1)
     """
 
+    def __init__(self) -> None:
+        super().__init__()
+        # Ensure these exist immediately — newer transformers versions only
+        # create them lazily on the first update() call, which causes
+        # AttributeError when diagnostic methods are called on an empty cache.
+        if not hasattr(self, "key_cache"):
+            self.key_cache: list = []
+        if not hasattr(self, "value_cache"):
+            self.value_cache: list = []
+
     # ── Factory ───────────────────────────────────────────────────────────────
 
     @classmethod
