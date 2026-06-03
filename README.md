@@ -4,6 +4,16 @@ A memory optimisation for **Multi-head Latent Attention (MLA)** models that repl
 
 Tested on **DeepSeek-V2-Lite** (deepseek-ai/DeepSeek-V2-Lite, 15.7 B parameters).
 
+### Benchmark results (RTX 6000, BF16, batch=1)
+
+| Context | Standard cache | Latent cache | Saving |
+|---|---|---|---|
+| 4 096 tokens | 1132 MB | 127 MB | **88.8%** |
+| 8 192 tokens | 2265 MB | 255 MB | **88.8%** |
+| 16 384 tokens | 4530 MB | 510 MB | **88.8%** |
+
+Output equivalence: **max |Δlogit| = 0.0000** across 64 generated tokens — bit-for-bit identical to the unpatched model.
+
 ---
 
 ## Table of Contents
