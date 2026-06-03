@@ -1,0 +1,113 @@
+================================================================
+  KV Latent Cache — Verification Suite
+  Target: DeepSeek-V2-Lite
+================================================================
+  model     : ./models/DeepSeek-V2-Lite
+  prompt    : The history of artificial intelligence begins in antiquity, ...
+  layer_idx : 0  (Test 1 hook)
+  gen_tokens: 64
+
+Loading model from: ./models/DeepSeek-V2-Lite
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading checkpoint shards:   0%|                                                                                                                | 0/4 [00:00<?, ?it/s]Loading checkpoint shards:  25%|██████████████████████████                                                                              | 1/4 [00:01<00:05,  2.00s/it]Loading checkpoint shards:  50%|████████████████████████████████████████████████████                                                    | 2/4 [00:03<00:03,  1.88s/it]Loading checkpoint shards:  75%|██████████████████████████████████████████████████████████████████████████████                          | 3/4 [00:05<00:01,  1.82s/it]Loading checkpoint shards: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████| 4/4 [00:06<00:00,  1.53s/it]Loading checkpoint shards: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████████| 4/4 [00:06<00:00,  1.66s/it]
+  dtype : torch.bfloat16
+  device: cuda:0
+
+────────────────────────────────────────────────────────────────
+  Pre-patch: collecting reference logits  (unpatched model)
+────────────────────────────────────────────────────────────────
+  Reference logits shape: (64, 1, 102400)
+
+────────────────────────────────────────────────────────────────
+  Pre-patch: measuring standard DynamicCache sizes
+────────────────────────────────────────────────────────────────
+     4096 tokens → 1132.19 MB
+     8192 tokens → 2264.65 MB
+    16384 tokens → 4529.57 MB
+
+────────────────────────────────────────────────────────────────
+  Test 1 — Latent round-trip  (pre-patch)
+────────────────────────────────────────────────────────────────
+  [[94m INFO [0m]  kv_a_norm shape : (1, 28, 512)  (layer 0)
+  [[94m INFO [0m]  kv_b_out  shape : (1, 28, 4096)
+  [[92m PASS [0m]  kv_b_proj(kv_a_norm) == kv_b_out  (exact round-trip)  (max_diff=0.00e+00)
+  [[92m PASS [0m]  kv_b_out last dim == num_heads×(qk_nope+v_dim) = 4096  (got 4096)
+
+  Overall Test 1: PASS
+
+────────────────────────────────────────────────────────────────
+  Patching model with patch_kv_model()...
+────────────────────────────────────────────────────────────────
+Patching 27 layers for KV latent cache...
+  [patch debug] layer 0:
+    num_heads=16  q_head_dim=192  scale=0.114721
+    qk_nope=128  qk_rope=64  v_head_dim=128
+    kv_lora_rank=512
+    attn.softmax_scale = 0.1147213867929261
+  Layer 0: patched (kv_a_norm + k_pe_roped caching)
+Done. 27 layers patched.
+
+Usage:
+  from ops.kv_latent_cache import KVLatentCache
+  output = model.generate(**inputs, past_key_values=KVLatentCache(), use_cache=True)
+
+────────────────────────────────────────────────────────────────
+  Test 2 — Output equivalence  (patched vs unpatched)
+────────────────────────────────────────────────────────────────
+  [[94m INFO [0m]    step 0: max |Δlogit| = 0.0000
+  [[94m INFO [0m]    step 1: max |Δlogit| = 0.0000
+  [[94m INFO [0m]    step 2: max |Δlogit| = 0.0000
+  [[94m INFO [0m]    step 3: max |Δlogit| = 0.0000
+  [[94m INFO [0m]    step 4: max |Δlogit| = 0.0000
+  [[92m PASS [0m]  max |Δlogit| < 2.0  (max=0.0000)
+  [[92m PASS [0m]  top-1 token unchanged  ← primary correctness gate
+  [[94m INFO [0m]  tokens compared: 64
+
+  Overall Test 2: PASS
+
+────────────────────────────────────────────────────────────────
+  Test 3 — Cache shape  (latent + k_pe must be stored)
+────────────────────────────────────────────────────────────────
+  [[94m INFO [0m]  Expected key   dim : 512  (kv_lora_rank — kv_a_norm)
+  [[94m INFO [0m]  Expected value dim : 64    (qk_rope_head_dim — k_pe_roped)
+  [[92m PASS [0m]  Actual key   dim : 512  (kv_a_norm ✓)
+  [[92m PASS [0m]  Actual value dim : 64  (k_pe_roped ✓)
+
+  Overall Test 3: PASS
+
+────────────────────────────────────────────────────────────────
+  Test 4 — Memory savings across context lengths
+────────────────────────────────────────────────────────────────
+  [[94m INFO [0m]  Standard dims/token : 5120  (16×(128+64) + 16×128)
+  [[94m INFO [0m]  Latent   dims/token : 576   (512 + 64)
+  [[94m INFO [0m]  Expected saving     : 88.8%
+
+  Context       Standard cache    Latent cache    Saving
+  ────────────────────────────────────────────────────────
+  4096 tok          1132.19 MB       127.37 MB     88.8%
+  8192 tok          2264.65 MB       254.77 MB     88.8%
+  16384 tok         4529.57 MB       509.58 MB     88.8%
+  ────────────────────────────────────────────────────────
+
+  [[92m PASS [0m]  Saving is constant across lengths (drift < 1pp)  (min=88.8%  max=88.8%  drift=0.00pp)
+  [[92m PASS [0m]  Observed saving ≈ theoretical 88.8%  (within 5pp)  (observed mean=88.8%)
+
+  Overall Test 4: PASS
+
+────────────────────────────────────────────────────────────────
+  Test 5 — Throughput  (skipped via --skip-throughput)
+────────────────────────────────────────────────────────────────
+
+================================================================
+  SUMMARY
+================================================================
+  [[92m PASS [0m]  Test 1 — Latent round-trip     
+  [[92m PASS [0m]  Test 2 — Output equivalence    
+  [[92m PASS [0m]  Test 3 — Cache shape           
+  [[92m PASS [0m]  Test 4 — Memory savings        
+  [[94m INFO [0m]  Test 5 — Throughput          (skipped)
+
+================================================================
+  ALL TESTS PASSED
+================================================================
+
