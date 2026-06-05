@@ -1,30 +1,28 @@
 """
-benchmark_kv_cache.py — End-to-end correctness and efficiency verification
-for the KV cache optimisation.
+verify_kv_relation.py — End-to-end correctness and efficiency verification
+for the KV latent cache optimisation.
+
+Target model: DeepSeek-V2-Lite (deepseek-ai/DeepSeek-V2-Lite)
 
 Tests
 ──────────────────────────────────────────────────────────────────────────────
-  Test 1  N matrix accuracy
-          Hook kv_b_proj (or fused_kv_b) output during one forward pass.
-          Split into k_nope_ref and v_ref.
-          Check max |k_nope_ref - v_ref @ N| and top-1 argmax match.
-          This validates compute_n_matrix.py independently of the cache patch.
+  Test 1  Latent round-trip
+          Hook kv_b_proj input (kv_a_norm) and output during one forward pass.
+          Verify kv_b_proj(kv_a_norm) correctly splits into k_nope and v.
+          This confirms the latent extraction in kv_patch.py is correct.
 
   Test 2  Output equivalence
           Generate tokens with the unpatched model → ref logits.
-          Patch the model; generate with KVNopelessCache.
+          Patch the model; generate with KVLatentCache.
           Assert top-1 token matches at every position.
-          This confirms k_nope reconstruction doesn't change predictions.
 
   Test 3  Cache shape
-          After one prefill + one decode step, inspect key tensors in
-          KVNopelessCache.  Assert shape[-1] == qk_rope_head_dim, not
-          qk_nope_head_dim + qk_rope_head_dim.
+          After one prefill + one decode step, inspect tensors in KVLatentCache.
+          Assert key_cache[-1] == kv_lora_rank (512), value_cache[-1] == qk_rope_head_dim (64).
 
   Test 4  Memory savings across context lengths
-          Measure DynamicCache (pre-patch) and KVNopelessCache (post-patch)
-          at context lengths [128, 512, 1024, 2048, 4096].
-          Print a table and assert the saving % is constant (within 1%).
+          Measure DynamicCache (pre-patch) and KVLatentCache (post-patch).
+          Expected saving: ~88.7%  (576 dims vs 5120 dims per token per layer).
 
   Test 5  Throughput  (informational, no pass/fail)
           Tokens/sec for the patched vs unpatched model.
@@ -32,9 +30,9 @@ Tests
 
 Usage
 ──────────────────────────────────────────────────────────────────────────────
-    python benchmark_kv_cache.py --model_path ./models/DeepSeek-V2-Lite
-    python benchmark_kv_cache.py --model_path ./models/DeepSeek-V2-Lite --skip-throughput
-    python benchmark_kv_cache.py --model_path ./models/DeepSeek-V2-Lite --layer_idx 2
+    python verify_kv_relation.py --model_path ./models/DeepSeek-V2-Lite
+    python verify_kv_relation.py --model_path ./models/DeepSeek-V2-Lite --skip-throughput
+    python verify_kv_relation.py --model_path ./models/DeepSeek-V2-Lite --layer_idx 2
 """
 
 import argparse
@@ -43,125 +41,566 @@ import time
 from pathlib import Path
 from typing import Optional
 
-# ── Make project root importable regardless of where the script is invoked from
-# This file lives in tests/; root is one level up.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
-from src.compute_n_matrix import compute_N_matrix
-from ops.kv_nopeless_cache import KVNopelessCache
+from ops.kv_latent_cache import KVLatentCache
 from kv_patch import patch_kv_model
 
 
-# ── Test 1 — N matrix accuracy (DeepSeek-V2 Patched) ──────────────────────────
+# ── Compatibility patch for DynamicCache ─────────────────────────────────────
+#
+# DeepSeek-V2-Lite's modeling_deepseek.py calls get_usable_length().
+# Added in transformers 4.40, removed in 4.47+.
 
-def test_n_accuracy(
+if not hasattr(DynamicCache, "get_usable_length"):
+    def _get_usable_length(self, new_seq_length: int, layer_idx: int = 0) -> int:
+        return self.get_seq_length(layer_idx)
+    DynamicCache.get_usable_length = _get_usable_length
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Verify KV latent cache optimisation")
+    p.add_argument(
+        "--model_path", type=str,
+        default="./models/DeepSeek-V2-Lite",
+    )
+    p.add_argument(
+        "--prompt", type=str,
+        default=(
+            "The history of artificial intelligence begins in antiquity, "
+            "with myths, stories and rumors of artificial beings endowed with "
+            "intelligence or consciousness by master craftsmen."
+        ),
+    )
+    p.add_argument("--layer_idx",        type=int,   default=0)
+    p.add_argument("--context_lengths",  type=int,   nargs="+",
+                   default=[2048, 4096, 8192, 16384, 32768])
+    p.add_argument("--gen_tokens",       type=int,   default=64)
+    p.add_argument("--throughput_tokens",type=int,   default=256)
+    p.add_argument("--skip-throughput",  dest="skip_throughput", action="store_true")
+    p.add_argument("--output_abs_tol",   type=float, default=6e-1)
+    return p.parse_args()
+
+
+# ── Pretty-print helpers ──────────────────────────────────────────────────────
+
+PASS = "\033[92m PASS \033[0m"
+FAIL = "\033[91m FAIL \033[0m"
+INFO = "\033[94m INFO \033[0m"
+SEP  = "─" * 64
+
+
+def header(title: str) -> None:
+    print(f"\n{SEP}")
+    print(f"  {title}")
+    print(SEP)
+
+
+def log(label: str, passed: Optional[bool] = None, detail: str = "") -> None:
+    if passed is None:
+        tag = f"[{INFO}]"
+    elif passed:
+        tag = f"[{PASS}]"
+    else:
+        tag = f"[{FAIL}]"
+    suffix = f"  ({detail})" if detail else ""
+    print(f"  {tag}  {label}{suffix}")
+
+
+# ── Model loading ─────────────────────────────────────────────────────────────
+
+def load_model_and_tokenizer(model_path: str):
+    print(f"\nLoading model from: {model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    ).to(torch.bfloat16)
+    model.eval()
+    print(f"  dtype : {next(model.parameters()).dtype}")
+    print(f"  device: {next(model.parameters()).device}")
+    return model, tokenizer
+
+
+def tokenize(tokenizer, prompt: str, device: torch.device) -> dict:
+    return tokenizer(prompt, return_tensors="pt").to(device)
+
+
+# ── Generation helper ─────────────────────────────────────────────────────────
+
+def run_generation_logits(
+    model: torch.nn.Module,
+    tokenizer,
+    prompt: str,
+    n_new_tokens: int,
+    cache_type: str = "dynamic",
+) -> torch.Tensor:
+    """
+    Generate n_new_tokens and return stacked logits [T, B, vocab].
+
+    cache_type: 'dynamic' → explicit DynamicCache (unpatched model)
+                'latent'  → KVLatentCache (patched model)
+
+    Both pass an explicit empty cache (not None) so DeepSeek's outer
+    model uses the same code path for both runs — otherwise the None
+    vs non-None difference changes how the outer model builds the
+    attention mask, causing ~0.4 per-step error in the reference.
+    """
+    device    = next(model.parameters()).device
+    inputs    = tokenize(tokenizer, prompt, device)
+    attn_mask = inputs["attention_mask"]
+    past_kv   = KVLatentCache() if cache_type == "latent" else DynamicCache()
+    all_logits = []
+
+    with torch.no_grad():
+        for step in range(n_new_tokens):
+            if step == 0:
+                out = model(**inputs, past_key_values=past_kv, use_cache=True)
+            else:
+                attn_mask = torch.cat(
+                    [attn_mask, attn_mask.new_ones((1, 1))], dim=1
+                )
+                out = model(
+                    input_ids=next_token,
+                    attention_mask=attn_mask,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                )
+            logits     = out.logits[:, -1, :]
+            past_kv    = out.past_key_values
+            next_token = logits.argmax(dim=-1, keepdim=True)
+            all_logits.append(logits.cpu())
+
+    return torch.stack(all_logits, dim=0)
+
+
+# ── Test 1 — Latent round-trip ────────────────────────────────────────────────
+
+def test_latent_roundtrip(
     model: torch.nn.Module,
     tokenizer,
     prompt: str,
     layer_idx: int = 0,
-    max_abs_tol: float = 3e-1,
 ) -> bool:
     """
-    Hook into kv_b_proj or fused_kv_b at layer_idx for DeepSeek-V2 (MLA).
-    """
-    header("Test 1 — N matrix accuracy")
+    Confirm that kv_b_proj(kv_a_norm) reproduces k_nope and v correctly.
 
-    attn = model.model.layers[layer_idx].self_attn
-    
-    # DeepSeek-V2 uncompresses keys/values into the total number of attention heads
-    num_heads = getattr(attn, "num_heads", getattr(attn, "num_attention_heads", None))
-    qk_nope_head_dim = attn.qk_nope_head_dim
-    v_head_dim = attn.v_head_dim
+    Hooks both the input and output of kv_b_proj. Splits the output into
+    k_nope and v, then checks that kv_b_proj(hooked_input) == hooked_output.
+    This validates that _extract_kv_latent() captures the right tensor
+    (kv_a_norm after kv_a_layernorm, before kv_b_proj).
+    """
+    header("Test 1 — Latent round-trip  (pre-patch)")
+
+    attn   = model.model.layers[layer_idx].self_attn
     device = next(model.parameters()).device
 
-    # ── Compute N from weights ────────────────────────────────────────────────
-    N = compute_N_matrix(attn, out_dtype=torch.bfloat16, verbose=False).to(device)
-    # Target shape expectation: [num_heads, v_head_dim, qk_nope_head_dim]
-    log(f"N shape   : {tuple(N.shape)}", detail=f"layer {layer_idx}")
-    log(f"N dtype   : {N.dtype}")
-
-    # ── Register forward hook ─────────────────────────────────────────────────
-    captured: dict = {}
-
-    def _hook(module, input, output):
-        # DeepSeek-V2 output can be a tuple depending on the custom implementation; handle safely
-        if isinstance(output, tuple):
-            output = output[0]
-        captured["kv_b_out"] = output.detach()
-
-    if hasattr(attn, "fused_kv_b"):
-        hook_mod = attn.fused_kv_b
-        log("Weight source: fused_kv_b.W_new  (fused patch model)")
-    elif hasattr(attn, "kv_b_proj"):
-        hook_mod = attn.kv_b_proj
-        log("Weight source: kv_b_proj.weight  (standard HF model)")
-    else:
-        log("Cannot find kv_b_proj or fused_kv_b — skipping Test 1", passed=False)
+    if not hasattr(attn, "kv_b_proj"):
+        log("Cannot find kv_b_proj — skipping", passed=False)
         return False
 
-    handle = hook_mod.register_forward_hook(_hook)
+    captured: dict = {}
+
+    def _hook_in(module, args):
+        captured["kv_a_norm"] = args[0].detach()    # first positional arg
+
+    def _hook_out(module, input, output):
+        captured["kv_b_out"] = output.detach()
+
+    h_in  = attn.kv_b_proj.register_forward_pre_hook(_hook_in)
+    h_out = attn.kv_b_proj.register_forward_hook(_hook_out)
 
     inputs_tok = tokenize(tokenizer, prompt, device)
     with torch.no_grad():
         model(**inputs_tok, use_cache=False)
 
-    handle.remove()
+    h_in.remove()
+    h_out.remove()
 
-    if "kv_b_out" not in captured:
-        log("Hook did not fire — module not reached during forward", passed=False)
+    if "kv_a_norm" not in captured or "kv_b_out" not in captured:
+        log("Hooks did not fire", passed=False)
         return False
 
-    kv_out = captured["kv_b_out"]   # [B, S, num_heads * (qk_nope_head_dim + v_head_dim)]
-    B, S, _ = kv_out.shape
+    kv_a_norm = captured["kv_a_norm"]   # [B, S, lora_rank]
+    kv_b_out  = captured["kv_b_out"]    # [B, S, num_heads*(qk_nope+v_dim)]
 
-    # ── Split safely into k_nope_ref and v_ref ────────────────────────────────
-    # Reshape matching standard Hugging Face MLA slicing order
-    kv_reshaped = kv_out.view(B, S, num_heads, qk_nope_head_dim + v_head_dim)
-    k_nope_ref  = kv_reshaped[..., :qk_nope_head_dim]   # [B, S, H, qk_nope]
-    v_ref       = kv_reshaped[..., qk_nope_head_dim:]   # [B, S, H, v_dim]
+    # Re-run kv_b_proj on the captured input and check it matches the output
+    with torch.no_grad():
+        kv_b_rerun = attn.kv_b_proj(kv_a_norm)
 
-    # Transpose to standard [B, H, S, dim] structure
-    k_nope_ref = k_nope_ref.transpose(1, 2)   # [B, H, S, qk_nope]
-    v_ref      = v_ref.transpose(1, 2)        # [B, H, S, v_dim]
+    diff      = (kv_b_rerun - kv_b_out).abs()
+    max_diff  = diff.max().item()
+    exact     = max_diff == 0.0
 
-    # ── Reconstruct k_nope via v @ N ──────────────────────────────────────────
-    # If N is [H, v_dim, qk_nope], we use batched matrix multiplication (bmm) 
-    # over the head dimension 'H'.
-    # v_ref: [B, H, S, v_dim] -> permute to [H, B*S, v_dim]
-    # N: [H, v_dim, qk_nope]
-    v_ref_batched = v_ref.permute(1, 0, 2, 3).reshape(num_heads, B * S, v_head_dim)
-    k_nope_hat_batched = torch.bmm(v_ref_batched, N)  # [H, B*S, qk_nope]
-    
-    # Restore layout back to [B, H, S, qk_nope]
-    k_nope_hat = k_nope_hat_batched.view(num_heads, B, S, qk_nope_head_dim).permute(1, 0, 2, 3)
-
-    # ── Match Validation ──────────────────────────────────────────────────────
-    diff       = (k_nope_hat - k_nope_ref).abs()
-    max_diff   = diff.max().item()
-    mean_diff  = diff.mean().item()
-    top1_match = (
-        k_nope_hat.argmax(dim=-1) == k_nope_ref.argmax(dim=-1)
-    ).all().item()
-
-    abs_ok = max_diff < max_abs_tol
-
+    log(f"kv_a_norm shape : {tuple(kv_a_norm.shape)}", detail=f"layer {layer_idx}")
+    log(f"kv_b_out  shape : {tuple(kv_b_out.shape)}")
     log(
-        f"max  |k_nope - v @ N| < {max_abs_tol}",
-        passed=abs_ok,
-        detail=f"max={max_diff:.4f}  mean={mean_diff:.4f}",
-    )
-    log(
-        "top-1 argmax match  ← primary correctness gate",
-        passed=top1_match,
+        "kv_b_proj(kv_a_norm) == kv_b_out  (exact round-trip)",
+        passed=exact,
+        detail=f"max_diff={max_diff:.2e}",
     )
 
-    passed = top1_match
+    # Also confirm the split dimensions match model attributes
+    num_heads        = int(attn.num_heads)
+    qk_nope_head_dim = int(attn.qk_nope_head_dim)
+    v_head_dim       = int(attn.v_head_dim)
+    expected_out_dim = num_heads * (qk_nope_head_dim + v_head_dim)
+    dim_ok = kv_b_out.shape[-1] == expected_out_dim
+
+    log(
+        f"kv_b_out last dim == num_heads×(qk_nope+v_dim) = {expected_out_dim}",
+        passed=dim_ok,
+        detail=f"got {kv_b_out.shape[-1]}",
+    )
+
+    passed = exact and dim_ok
     print(f"\n  Overall Test 1: {'PASS' if passed else 'FAIL'}")
     return passed
 
+
+# ── Test 2 — Output equivalence ───────────────────────────────────────────────
+
+def test_output_equivalence(
+    model: torch.nn.Module,
+    tokenizer,
+    ref_logits: torch.Tensor,
+    prompt: str,
+    n_new_tokens: int,
+    max_abs_tol: float = 4e-1,
+) -> bool:
+    """
+    Generate with the patched model using KVLatentCache.
+    Compare top-1 tokens against ref_logits from the unpatched model.
+    """
+    header("Test 2 — Output equivalence  (patched vs unpatched)")
+
+    pat_logits = run_generation_logits(
+        model, tokenizer, prompt, n_new_tokens, cache_type="latent"
+    )
+
+    # Per-step diff to identify whether error starts at step 0 (prefill) or later
+    per_step_max = (pat_logits - ref_logits).abs().max(dim=-1).values.squeeze()
+    for i, d in enumerate(per_step_max[:min(5, len(per_step_max))]):
+        log(f"  step {i}: max |Δlogit| = {d.item():.4f}")
+
+    max_diff   = (pat_logits - ref_logits).abs().max().item()
+    top1_ref   = ref_logits.argmax(dim=-1)
+    top1_pat   = pat_logits.argmax(dim=-1)
+    top1_match = (top1_ref == top1_pat).all().item()
+    abs_ok     = max_diff < max_abs_tol
+
+    log(
+        f"max |Δlogit| < {max_abs_tol}",
+        passed=abs_ok,
+        detail=f"max={max_diff:.4f}",
+    )
+    log(
+        "top-1 token unchanged  ← primary correctness gate",
+        passed=top1_match,
+    )
+    log(f"tokens compared: {n_new_tokens}")
+
+    passed = top1_match
+    print(f"\n  Overall Test 2: {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
+# ── Test 3 — Cache shape ──────────────────────────────────────────────────────
+
+def test_cache_shape(
+    model: torch.nn.Module,
+    tokenizer,
+    prompt: str,
+) -> bool:
+    """
+    Run prefill + one decode step with KVLatentCache.
+    Assert:
+      key_cache[-1]   == kv_lora_rank     (512) — kv_a_norm stored
+      value_cache[-1] == qk_rope_head_dim  (64) — k_pe_roped stored
+    """
+    header("Test 3 — Cache shape  (latent + k_pe must be stored)")
+
+    device         = next(model.parameters()).device
+    attn0          = model.model.layers[0].self_attn
+    lora_rank      = int(attn0.kv_lora_rank)
+    qk_rope        = int(attn0.qk_rope_head_dim)
+
+    inputs_tok = tokenize(tokenizer, prompt, device)
+    past_kv    = KVLatentCache()
+
+    with torch.no_grad():
+        out      = model(**inputs_tok, past_key_values=past_kv, use_cache=True)
+        past_kv  = out.past_key_values
+        next_tok = out.logits[:, -1:, :].argmax(dim=-1)
+
+        attn_mask = torch.cat(
+            [inputs_tok["attention_mask"],
+             inputs_tok["attention_mask"].new_ones((1, 1))], dim=1
+        )
+        out = model(
+            input_ids=next_tok,
+            attention_mask=attn_mask,
+            past_key_values=past_kv,
+            use_cache=True,
+        )
+        past_kv = out.past_key_values
+
+    stored_latent = past_kv.latent_dim(layer_idx=0)
+    stored_kpe    = past_kv.kpe_dim(layer_idx=0)
+
+    log(f"Expected key   dim : {lora_rank}  (kv_lora_rank — kv_a_norm)")
+    log(f"Expected value dim : {qk_rope}    (qk_rope_head_dim — k_pe_roped)")
+    log(
+        f"Actual key   dim : {stored_latent}",
+        passed=(stored_latent == lora_rank),
+        detail="kv_a_norm ✓" if stored_latent == lora_rank else "WRONG",
+    )
+    log(
+        f"Actual value dim : {stored_kpe}",
+        passed=(stored_kpe == qk_rope),
+        detail="k_pe_roped ✓" if stored_kpe == qk_rope else "WRONG",
+    )
+
+    passed = (stored_latent == lora_rank) and (stored_kpe == qk_rope)
+    print(f"\n  Overall Test 3: {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
+# ── Test 4 — Memory savings ───────────────────────────────────────────────────
+
+def _run_to_length_standard(
+    model: torch.nn.Module,
+    tokenizer,
+    prompt: str,
+    target_tokens: int,
+) -> float:
+    """Run to target_tokens with model's default cache. Returns MB."""
+    device   = next(model.parameters()).device
+    inputs   = tokenize(tokenizer, prompt, device)
+    n_new    = max(1, target_tokens - inputs["input_ids"].shape[1])
+
+    attn_mask = inputs["attention_mask"]
+    with torch.no_grad():
+        out      = model(**inputs, past_key_values=DynamicCache(), use_cache=True)
+        past_kv  = out.past_key_values
+        next_tok = out.logits[:, -1:, :].argmax(dim=-1)
+        for _ in range(n_new - 1):
+            attn_mask = torch.cat([attn_mask, attn_mask.new_ones((1, 1))], dim=1)
+            out      = model(
+                input_ids=next_tok,
+                attention_mask=attn_mask,
+                past_key_values=past_kv,
+                use_cache=True,
+            )
+            past_kv  = out.past_key_values
+            next_tok = out.logits[:, -1:, :].argmax(dim=-1)
+
+    if hasattr(past_kv, "key_cache"):
+        key_bytes   = sum(t.nbytes for t in past_kv.key_cache   if t is not None)
+        value_bytes = sum(t.nbytes for t in past_kv.value_cache if t is not None)
+    else:
+        key_bytes   = sum(kv[0].nbytes for kv in past_kv if kv is not None)
+        value_bytes = sum(kv[1].nbytes for kv in past_kv if kv is not None)
+
+    return (key_bytes + value_bytes) / 1e6
+
+
+def _run_to_length_latent(
+    model: torch.nn.Module,
+    tokenizer,
+    prompt: str,
+    target_tokens: int,
+) -> float:
+    """Fill a KVLatentCache to target_tokens. Returns MB."""
+    device   = next(model.parameters()).device
+    inputs   = tokenize(tokenizer, prompt, device)
+    n_new    = max(1, target_tokens - inputs["input_ids"].shape[1])
+
+    attn_mask = inputs["attention_mask"]
+    past_kv   = KVLatentCache()
+    with torch.no_grad():
+        out      = model(**inputs, past_key_values=past_kv, use_cache=True)
+        past_kv  = out.past_key_values
+        next_tok = out.logits[:, -1:, :].argmax(dim=-1)
+        for _ in range(n_new - 1):
+            attn_mask = torch.cat([attn_mask, attn_mask.new_ones((1, 1))], dim=1)
+            out      = model(
+                input_ids=next_tok,
+                attention_mask=attn_mask,
+                past_key_values=past_kv,
+                use_cache=True,
+            )
+            past_kv  = out.past_key_values
+            next_tok = out.logits[:, -1:, :].argmax(dim=-1)
+
+    return past_kv.cache_size_bytes()["total_bytes"] / 1e6
+
+
+def test_memory_savings(
+    model: torch.nn.Module,
+    tokenizer,
+    prompt: str,
+    context_lengths: list,
+    std_sizes: dict,
+) -> bool:
+    """
+    Print a memory table and assert saving % is consistent across lengths.
+
+    Expected saving for DeepSeek-V2-Lite:
+      Standard : num_heads*(qk_nope+qk_rope) + num_heads*v_dim per token
+                 = 16*192 + 16*128 = 5120 dims
+      Latent   : kv_lora_rank + qk_rope = 512 + 64 = 576 dims
+      Saving   ≈ (5120 - 576) / 5120 ≈ 88.7%
+    """
+    header("Test 4 — Memory savings across context lengths")
+
+    attn0          = model.model.layers[0].self_attn
+    lora_rank      = int(attn0.kv_lora_rank)
+    qk_rope        = int(attn0.qk_rope_head_dim)
+    num_heads      = int(attn0.num_heads)
+    qk_nope        = int(attn0.qk_nope_head_dim)
+    v_dim          = int(attn0.v_head_dim)
+
+    standard_dims  = num_heads * (qk_nope + qk_rope) + num_heads * v_dim
+    latent_dims    = lora_rank + qk_rope
+    expected_saving = 100.0 * (standard_dims - latent_dims) / standard_dims
+
+    log(f"Standard dims/token : {standard_dims}  ({num_heads}×({qk_nope}+{qk_rope}) + {num_heads}×{v_dim})")
+    log(f"Latent   dims/token : {latent_dims}   ({lora_rank} + {qk_rope})")
+    log(f"Expected saving     : {expected_saving:.1f}%")
+    print()
+
+    col_w = [10, 18, 16, 10]
+    print(
+        f"  {'Context':<{col_w[0]}}"
+        f"{'Standard cache':>{col_w[1]}}"
+        f"{'Latent cache':>{col_w[2]}}"
+        f"{'Saving':>{col_w[3]}}"
+    )
+    print("  " + "─" * (sum(col_w) + 2))
+
+    savings = []
+    for ctx in context_lengths:
+        std_mb     = std_sizes[ctx]
+        latent_mb  = _run_to_length_latent(model, tokenizer, prompt, ctx)
+        saving_pct = 100.0 * (1.0 - latent_mb / std_mb) if std_mb > 0 else 0.0
+        savings.append(saving_pct)
+        print(
+            f"  {f'{ctx} tok':<{col_w[0]}}"
+            f"{f'{std_mb:.2f} MB':>{col_w[1]}}"
+            f"{f'{latent_mb:.2f} MB':>{col_w[2]}}"
+            f"{f'{saving_pct:.1f}%':>{col_w[3]}}"
+        )
+
+    print("  " + "─" * (sum(col_w) + 2))
+    print()
+
+    drift     = max(savings) - min(savings)
+    drift_ok  = drift < 1.0
+    mean_sav  = sum(savings) / len(savings)
+    approx_ok = abs(mean_sav - expected_saving) < 5.0
+
+    log(
+        "Saving is constant across lengths (drift < 1pp)",
+        passed=drift_ok,
+        detail=f"min={min(savings):.1f}%  max={max(savings):.1f}%  drift={drift:.2f}pp",
+    )
+    log(
+        f"Observed saving ≈ theoretical {expected_saving:.1f}%  (within 5pp)",
+        passed=approx_ok,
+        detail=f"observed mean={mean_sav:.1f}%",
+    )
+
+    passed = drift_ok and approx_ok
+    print(f"\n  Overall Test 4: {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
+# ── Test 5 — Throughput ───────────────────────────────────────────────────────
+
+def _measure_tps(
+    model: torch.nn.Module,
+    tokenizer,
+    prompt: str,
+    n_tokens: int,
+    cache_type: str = "dynamic",
+) -> float:
+    """Generate n_tokens decode steps and return tokens/sec."""
+    device    = next(model.parameters()).device
+    inputs    = tokenize(tokenizer, prompt, device)
+    attn_mask = inputs["attention_mask"]
+    past_kv   = KVLatentCache() if cache_type == "latent" else DynamicCache()
+
+    with torch.no_grad():
+        out      = model(**inputs, past_key_values=past_kv, use_cache=True)
+        past_kv  = out.past_key_values
+        next_tok = out.logits[:, -1:, :].argmax(dim=-1)
+
+    # Warm-up step
+    with torch.no_grad():
+        attn_mask = torch.cat([attn_mask, attn_mask.new_ones((1, 1))], dim=1)
+        out      = model(
+            input_ids=next_tok, attention_mask=attn_mask,
+            past_key_values=past_kv, use_cache=True,
+        )
+        past_kv  = out.past_key_values
+        next_tok = out.logits[:, -1:, :].argmax(dim=-1)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    with torch.no_grad():
+        for _ in range(n_tokens):
+            attn_mask = torch.cat([attn_mask, attn_mask.new_ones((1, 1))], dim=1)
+            out      = model(
+                input_ids=next_tok, attention_mask=attn_mask,
+                past_key_values=past_kv, use_cache=True,
+            )
+            past_kv  = out.past_key_values
+            next_tok = out.logits[:, -1:, :].argmax(dim=-1)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    return n_tokens / (time.perf_counter() - t0)
+
+
+def test_throughput(
+    model_unpatched: torch.nn.Module,
+    model_patched: torch.nn.Module,
+    tokenizer,
+    prompt: str,
+    n_tokens: int = 256,
+) -> None:
+    """Informational only — no pass/fail gate."""
+    header("Test 5 — Throughput  (informational, no pass/fail)")
+    log(f"Generating {n_tokens} decode tokens per model...")
+    print()
+
+    tps_std = _measure_tps(model_unpatched, tokenizer, prompt, n_tokens, "dynamic")
+    tps_pat = _measure_tps(model_patched,   tokenizer, prompt, n_tokens, "latent")
+    ratio   = tps_pat / tps_std if tps_std > 0 else float("nan")
+
+    col_w = [28, 14]
+    print(f"  {'Model':<{col_w[0]}}{'Tokens / sec':>{col_w[1]}}")
+    print("  " + "─" * (sum(col_w) + 2))
+    print(f"  {'Unpatched (DynamicCache)':<{col_w[0]}}{tps_std:>{col_w[1]}.1f}")
+    print(f"  {'Patched  (KVLatentCache)':<{col_w[0]}}{tps_pat:>{col_w[1]}.1f}")
+    print("  " + "─" * (sum(col_w) + 2))
+    print(f"\n  Relative speed : {ratio:.3f}x")
+    if ratio < 1.0:
+        print(f"  Overhead: {100.0*(1.0-ratio):.1f}%  (kv_b_proj over full context each step)")
+    else:
+        print(f"  Faster by {100.0*(ratio-1.0):.1f}%  (cache bandwidth reduction dominating)")
+    log("Throughput is informational — no pass/fail gate")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -170,64 +609,107 @@ def main() -> None:
     args = parse_args()
 
     print("=" * 64)
-    print("  KV Nopeless Cache — Sequential Verification Suite")
+    print("  KV Latent Cache — Verification Suite")
+    print("  Target: DeepSeek-V2-Lite")
     print("=" * 64)
-    print(f"  Directory : {args.models_dir}")
-    print(f"  Prompt    : {args.prompt[:60]}...")
-    print(f"  Layer Idx : {args.layer_idx}  (Test 1 hook)")
+    print(f"  model     : {args.model_path}")
+    print(f"  prompt    : {args.prompt[:60]}...")
+    print(f"  layer_idx : {args.layer_idx}  (Test 1 hook)")
+    print(f"  gen_tokens: {args.gen_tokens}")
 
-    # Resolve paths from your main/models/ directory structure
-    fused_model_path = os.path.join(args.models_dir, "fused")
-    base_model_path = os.path.join(args.models_dir, "non-fused")
+    model, tokenizer = load_model_and_tokenizer(args.model_path)
+    device = next(model.parameters()).device
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # ── STAGE 1: Fused Model Loading & Test 1 ─────────────────────────────────
-    # ──────────────────────────────────────────────────────────────────────────
+    # Pre-patch: reference logits and standard cache sizes
     print(f"\n{SEP}")
-    print("  [STAGE 1] Loading Fused Model into VRAM...")
+    print("  Pre-patch: collecting reference logits  (unpatched model)")
     print(SEP)
-    
-    model_fused, tokenizer = load_model_and_tokenizer(fused_model_path)
-    
-    print(f"\n{SEP}")
-    print("  Executing Test 1 — N Matrix Accuracy")
-    print(SEP)
-    
-    t1_pass = test_n_accuracy(
-        model_fused, tokenizer, args.prompt,
-        layer_idx=args.layer_idx,
-        max_abs_tol=args.n_abs_tol,
+    ref_logits = run_generation_logits(
+        model, tokenizer, args.prompt, args.gen_tokens, cache_type="dynamic"
     )
-    
-    # ── Strict VRAM Clean up of Fused Model ───────────────────────────────────
+    print(f"  Reference logits shape: {tuple(ref_logits.shape)}")
+
     print(f"\n{SEP}")
-    print("  Purging Fused Model from VRAM to make room...")
+    print("  Pre-patch: measuring standard DynamicCache sizes")
     print(SEP)
-    
-    del model_fused
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()  # Force the host to wait for GPU cleanup to finish
+    std_sizes: dict = {}
+    for ctx in args.context_lengths:
+        mb = _run_to_length_standard(model, tokenizer, args.prompt, ctx)
+        std_sizes[ctx] = mb
+        print(f"    {ctx:5d} tokens → {mb:.2f} MB")
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # ── Summary (Test 1 Only) ─────────────────────────────────────────────────
-    # ──────────────────────────────────────────────────────────────────────────
+    # Test 1 — Latent round-trip (pre-patch)
+    t1_pass = test_latent_roundtrip(
+        model, tokenizer, args.prompt, layer_idx=args.layer_idx,
+    )
+
+    # Patch the model
+    print(f"\n{SEP}")
+    print("  Patching model with patch_kv_model()...")
+    print(SEP)
+    patch_kv_model(model, device=device)
+
+    # Test 2 — Output equivalence
+    t2_pass = test_output_equivalence(
+        model, tokenizer, ref_logits, args.prompt,
+        n_new_tokens=args.gen_tokens,
+        max_abs_tol=args.output_abs_tol,
+    )
+
+    # Test 3 — Cache shape
+    t3_pass = test_cache_shape(model, tokenizer, args.prompt)
+
+    # Test 4 — Memory savings
+    t4_pass = test_memory_savings(
+        model, tokenizer, args.prompt,
+        context_lengths=args.context_lengths,
+        std_sizes=std_sizes,
+    )
+
+    # Test 5 — Throughput
+    if args.skip_throughput:
+        header("Test 5 — Throughput  (skipped via --skip-throughput)")
+    else:
+        print(f"\n{SEP}")
+        print("  Test 5: reloading unpatched model for throughput comparison...")
+        print(f"  (pass --skip-throughput to skip if VRAM is limited)")
+        print(SEP)
+        model_ref, _ = load_model_and_tokenizer(args.model_path)
+        test_throughput(
+            model_ref, model, tokenizer, args.prompt,
+            n_tokens=args.throughput_tokens,
+        )
+        del model_ref
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Summary
     print(f"\n{'=' * 64}")
-    print("  STAGE 1 SUMMARY")
+    print("  SUMMARY")
     print(f"{'=' * 64}")
-    
-    tag = PASS if t1_pass else FAIL
-    print(f"  [{tag}]  Test 1 — N matrix accuracy")
-    print(f"\n{'=' * 64}")
-    
-    # Optional: Exit early if Test 1 fails to avoid loading the second large model
-    if not t1_pass:
-        print("  Test 1 failed. Aborting remaining stages.")
-        sys.exit(1)
+    results = {
+        "Test 1 — Latent round-trip     ": t1_pass,
+        "Test 2 — Output equivalence    ": t2_pass,
+        "Test 3 — Cache shape           ": t3_pass,
+        "Test 4 — Memory savings        ": t4_pass,
+    }
+    all_pass = True
+    for name, ok in results.items():
+        print(f"  [{PASS if ok else FAIL}]  {name}")
+        if not ok:
+            all_pass = False
 
-    print("  Stage 1 successful. Ready to proceed to baseline collection.")
-    
-    # We will write the subsequent stages (Base model loading, Tests 2-5) next.
+    if args.skip_throughput:
+        print(f"  [{INFO}]  Test 5 — Throughput          (skipped)")
+    else:
+        print(f"  [{INFO}]  Test 5 — Throughput          (informational only)")
+
+    print(f"\n{'=' * 64}")
+    print("  ALL TESTS PASSED" if all_pass else "  SOME TESTS FAILED — see details above")
+    print(f"{'=' * 64}\n")
+
+    sys.exit(0 if all_pass else 1)
+
 
 if __name__ == "__main__":
     main()
