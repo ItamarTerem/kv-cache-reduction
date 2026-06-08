@@ -10,9 +10,9 @@
 #               ~31 GB  (15.7B params, BF16). Public — no token required.
 #               Use for local debugging (same MLA architecture as Kimi).
 #
-#   kimi      — nvidia/Kimi-K2.6-NVFP4
-#               https://huggingface.co/nvidia/Kimi-K2.6-NVFP4
-#               ~500 GB (1T params, NVFP4). Public — no token required.
+#   kimi      — niraj-runara/Kimi-K2.6-NVFP4
+#               https://huggingface.co/niraj-runara/Kimi-K2.6-NVFP4
+#               ~500 GB (1T params, NVFP4). Private — HF_TOKEN required.
 #
 # Usage:
 #   bash scripts/download_model.sh                   # downloads deepseek (default)
@@ -41,11 +41,11 @@ case "$MODEL" in
         REQUIRES_TOKEN=false
         ;;
     kimi)
-        DEFAULT_MODEL_ID="nvidia/Kimi-K2.6-NVFP4"
+        DEFAULT_MODEL_ID="niraj-runara/Kimi-K2.6-NVFP4"
         DEFAULT_MODEL_DIR="${ROOT}/models/Kimi-K2.6-NVFP4"
         APPROX_SIZE_GIB=520
         MODEL_LABEL="Kimi-K2.6 NVFP4"
-        REQUIRES_TOKEN=false
+        REQUIRES_TOKEN=true
         ;;
     *)
         echo "ERROR: Unknown MODEL='$MODEL'. Valid options: deepseek | kimi"
