@@ -2,7 +2,10 @@
 verify_kv_relation.py — End-to-end correctness and efficiency verification
 for the KV latent cache optimisation.
 
-Target model: DeepSeek-V2-Lite (deepseek-ai/DeepSeek-V2-Lite)
+Supported models
+──────────────────────────────────────────────────────────────────────────────
+  DeepSeek-V2-Lite  (deepseek-ai/DeepSeek-V2-Lite)  — proxy for debugging
+  Kimi-K2.6 NVFP4   (nvidia/Kimi-K2.6-NVFP4)        — target model
 
 Tests
 ──────────────────────────────────────────────────────────────────────────────
@@ -22,16 +25,22 @@ Tests
 
   Test 4  Memory savings across context lengths
           Measure DynamicCache (pre-patch) and KVLatentCache (post-patch).
-          Expected saving: ~88.7%  (576 dims vs 5120 dims per token per layer).
+          Expected saving: computed from model config — ~88.7% for DeepSeek-V2-Lite.
 
   Test 5  Throughput  (informational, no pass/fail)
           Tokens/sec for the patched vs unpatched model.
           Gated with --skip-throughput.
+          NOTE: Kimi-K2.6 requires ~500 GB VRAM to load two copies; use
+          --skip-throughput on single-node setups.
 
 Usage
 ──────────────────────────────────────────────────────────────────────────────
+    # DeepSeek-V2-Lite (proxy, debugging)
     python verify_kv_relation.py --model_path ./models/DeepSeek-V2-Lite
-    python verify_kv_relation.py --model_path ./models/DeepSeek-V2-Lite --skip-throughput
+
+    # Kimi-K2.6 NVFP4 (target, multi-GPU)
+    python verify_kv_relation.py --model_path ./models/Kimi-K2.6-NVFP4 --skip-throughput
+
     python verify_kv_relation.py --model_path ./models/DeepSeek-V2-Lite --layer_idx 2
 """
 
@@ -68,6 +77,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--model_path", type=str,
         default="./models/DeepSeek-V2-Lite",
+        help="Path to model weights. Use ./models/DeepSeek-V2-Lite (proxy) or "
+             "./models/Kimi-K2.6-NVFP4 (target).",
     )
     p.add_argument(
         "--prompt", type=str,
@@ -453,11 +464,12 @@ def test_memory_savings(
     """
     Print a memory table and assert saving % is consistent across lengths.
 
-    Expected saving for DeepSeek-V2-Lite:
+    Expected saving is computed from model config:
       Standard : num_heads*(qk_nope+qk_rope) + num_heads*v_dim per token
-                 = 16*192 + 16*128 = 5120 dims
-      Latent   : kv_lora_rank + qk_rope = 512 + 64 = 576 dims
-      Saving   ≈ (5120 - 576) / 5120 ≈ 88.7%
+      Latent   : kv_lora_rank + qk_rope per token
+      Saving   = 1 - latent_dims / standard_dims
+    For DeepSeek-V2-Lite: 576 / 5120 → ~88.7% saving.
+    For Kimi-K2.6:        computed from model attributes at test time.
     """
     header("Test 4 — Memory savings across context lengths")
 
@@ -608,9 +620,10 @@ def test_throughput(
 def main() -> None:
     args = parse_args()
 
+    model_name = Path(args.model_path).name
     print("=" * 64)
     print("  KV Latent Cache — Verification Suite")
-    print("  Target: DeepSeek-V2-Lite")
+    print(f"  Model: {model_name}")
     print("=" * 64)
     print(f"  model     : {args.model_path}")
     print(f"  prompt    : {args.prompt[:60]}...")
@@ -673,6 +686,7 @@ def main() -> None:
         print(f"\n{SEP}")
         print("  Test 5: reloading unpatched model for throughput comparison...")
         print(f"  (pass --skip-throughput to skip if VRAM is limited)")
+        print(f"  NOTE: Kimi-K2.6 requires ~500 GB VRAM for two copies — use --skip-throughput on single-node setups")
         print(SEP)
         model_ref, _ = load_model_and_tokenizer(args.model_path)
         test_throughput(
