@@ -1,4 +1,4 @@
-# requirements.txt — DeepSeek-V2-Lite KV nopeless cache project
+# requirements.txt — KV latent cache project (DeepSeek-V2-Lite proxy + Kimi-K2.6 NVFP4)
 #
 # DO NOT add torch here.
 # It is installed separately by scripts/setup_runtime.sh because it requires
@@ -6,14 +6,14 @@
 #   torch → https://download.pytorch.org/whl/cu128  (CUDA version specific)
 
 # ── Model loading ────────────────────────────────────────────────────────────
-# transformers: DeepSeek-V2-Lite requires trust_remote_code=True and a recent
+# transformers: both models require trust_remote_code=True and a recent
 # transformers. Upper bound avoids 5.x breaking the custom modeling code.
 transformers>=4.57.1,<5.0.0
 
 # accelerate: required for device_map="auto" in AutoModelForCausalLM
 accelerate>=0.33.0
 
-# safetensors: DeepSeek-V2-Lite weights are stored in safetensors format
+# safetensors: model weights are stored in safetensors format
 safetensors>=0.4.0
 
 # huggingface_hub: model download and cache management
