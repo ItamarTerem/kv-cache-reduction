@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/setup_runtime.sh
 #
-# Sets up the Python environment for DeepSeek-V2-Lite KV cache testing.
+# Sets up the Python environment for KV latent cache testing.
 # Installs PyTorch (CUDA-aware) + project dependencies only.
 #
 # Usage (run once from anywhere):
@@ -20,7 +20,7 @@ VENV="${VENV:-${ROOT}/.venv}"
 REQ="${ROOT}/requirements.txt"
 
 echo "======================================"
-echo " DeepSeek-V2-Lite environment setup"
+echo " KV latent cache environment setup"
 echo " Root : $ROOT"
 echo " Venv : $VENV"
 echo "======================================"
@@ -147,6 +147,6 @@ echo "   source $VENV/bin/activate"
 echo ""
 echo " Next steps:"
 echo "   bash scripts/download_model.sh     # download model weights"
-echo "   python tests/verify_kv_relation.py --model_path models/DeepSeek-V2-Lite"
+echo "   python tests/verify_kv_relation.py --model_path models/DeepSeek-V2-Lite  # proxy
+#   python tests/verify_kv_relation.py --model_path models/Kimi-K2.6-NVFP4  # full model"
 echo "======================================"
-
