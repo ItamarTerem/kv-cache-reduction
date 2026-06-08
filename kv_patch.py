@@ -1,7 +1,13 @@
 """
 kv_patch.py — Patch MLA attention to use KVLatentCache.
 
-Target model: DeepSeek-V2-Lite (deepseek-ai/DeepSeek-V2-Lite)
+Supported models
+──────────────────────────────────────────────────────────────────────────────
+  • DeepSeek-V2-Lite  (deepseek-ai/DeepSeek-V2-Lite)   — proxy for debugging
+  • Kimi-K2.6 NVFP4   (nvidia/Kimi-K2.6-NVFP4)         — target model
+
+Both share the same MLA architecture and attribute names. Differences are
+handled automatically at patch time by the resolver helpers below.
 
 What this file does
 ──────────────────────────────────────────────────────────────────────────────
@@ -18,12 +24,12 @@ Cache layout
 
 Reconstruction at attention time (exact, not approximate)
 ──────────────────────────────────────────────────────────────────────────────
-  kv_a_norm_acc  →  kv_b_proj  →  [B, S, 16 × 256]
-                 →  reshape    →  [B, 16, S, 256]
-                 →  split      →  k_nope_acc [B, 16, S, 128]
-                                  v_acc      [B, 16, S, 128]
-  k_pe_acc.expand(16 heads)   →  [B, 16, S, 64]
-  k = cat([k_nope_acc, k_pe_acc_exp], dim=-1)  →  [B, 16, S, 192]
+  kv_a_norm_acc  →  kv_b_proj  →  [B, S, H × (nope+v)]
+                 →  reshape    →  [B, H, S, nope+v]
+                 →  split      →  k_nope_acc [B, H, S, qk_nope]
+                                  v_acc      [B, H, S, v_dim]
+  k_pe_acc.expand(H heads)    →  [B, H, S, qk_rope]
+  k = cat([k_nope_acc, k_pe_acc_exp], dim=-1)
 
 Usage
 ──────────────────────────────────────────────────────────────────────────────
@@ -50,14 +56,28 @@ from ops.kv_relation_module import KVRelationModule  # kept for verify_kv_relati
 # ── Model-difference helpers (resolved once at patch time) ───────────────────
 
 def _resolve_rope_fn(attn: nn.Module):
-    """Return the module-level apply_rotary_pos_emb for DeepSeek-V2-Lite."""
+    """
+    Return the apply_rotary_pos_emb callable for this attention module.
+
+    DeepSeek-V2-Lite: module-level function in the modeling file.
+    Kimi-K2.6:        may be a method on the attention class itself,
+                      or still a module-level function.
+    We try both and raise only if neither is found.
+    """
+    # 1. Method on the attention instance (Kimi-style)
+    if hasattr(attn, "apply_rotary_pos_emb"):
+        return attn.apply_rotary_pos_emb
+
+    # 2. Module-level function in the modeling file (DeepSeek-style)
     mod = importlib.import_module(type(attn).__module__)
     fn  = getattr(mod, "apply_rotary_pos_emb", None)
-    if fn is None:
-        raise AttributeError(
-            f"Could not find apply_rotary_pos_emb in {type(attn).__module__}."
-        )
-    return fn
+    if fn is not None:
+        return fn
+
+    raise AttributeError(
+        f"Could not find apply_rotary_pos_emb on {type(attn).__name__} "
+        f"or in {type(attn).__module__}."
+    )
 
 
 def _resolve_scale(attn: nn.Module) -> float:
@@ -123,13 +143,18 @@ def _extract_kv_latent(
 
 def _patch_attention_forward(attn: nn.Module, debug: bool = False) -> None:
     """
-    Replace attn.forward with a latent-cache forward for DeepSeek-V2-Lite.
+    Replace attn.forward with a latent-cache forward.
+    Supports DeepSeek-V2-Lite and Kimi-K2.6 NVFP4.
     All model-specific values are resolved once here and captured in the closure.
     """
-    _apply_rope  = _resolve_rope_fn(attn)
-    _scale       = _resolve_scale(attn)
-    _q_head_dim  = _resolve_q_head_dim(attn)
-    _num_heads   = int(attn.num_heads)
+    _apply_rope   = _resolve_rope_fn(attn)
+    _scale        = _resolve_scale(attn)
+    _q_head_dim   = _resolve_q_head_dim(attn)
+    _num_heads    = int(attn.num_heads)
+    # Detect rotary_emb API: old models use seq_len=, newer use position_ids=
+    import inspect as _inspect
+    _rope_sig = _inspect.signature(attn.rotary_emb.forward)
+    _rope_uses_seq_len = "seq_len" in _rope_sig.parameters
 
     if debug:
         print(f"  [patch debug] layer {attn.layer_idx}:")
@@ -181,7 +206,10 @@ def _patch_attention_forward(attn: nn.Module, debug: bool = False) -> None:
         if cache is not None:
             kv_seq_len += cache.get_usable_length(q_len, attn.layer_idx)
 
-        cos, sin = attn.rotary_emb(q_pe, seq_len=kv_seq_len)
+        if _rope_uses_seq_len:
+            cos, sin = attn.rotary_emb(q_pe, seq_len=kv_seq_len)
+        else:
+            cos, sin = attn.rotary_emb(q_pe, position_ids=position_ids)
 
         # Apply RoPE to q_pe and k_pe separately so k_pe stays contiguous
         # with 1 head — matching the original forward's tensor layout exactly.
@@ -271,16 +299,17 @@ def patch_kv_model(
     device: torch.device | None = None,
 ) -> nn.Module:
     """
-    Patch all decoder layers in a DeepSeek-V2-Lite model to use KVLatentCache.
+    Patch all decoder layers in an MLA model to use KVLatentCache.
 
+    Supports DeepSeek-V2-Lite (proxy) and Kimi-K2.6 NVFP4 (target).
     For each layer, replaces attn.forward with a closure that:
       1. Extracts kv_a_norm (before kv_b_proj) and k_pe
       2. Applies RoPE to q_pe and k_pe
-      3. Caches (kv_a_norm, k_pe_roped) — not (k_pe, v)
+      3. Caches (kv_a_norm, k_pe_roped) — not (k, v)
       4. Reconstructs k_nope and v exactly via kv_b_proj at attention time
 
     Args:
-        model:  DeepSeek-V2-Lite HuggingFace causal LM
+        model:  HuggingFace causal LM (DeepSeek-V2-Lite or Kimi-K2.6)
         device: target device (defaults to model's current device)
 
     Returns:
